@@ -1,0 +1,108 @@
+name: macOS App Build
+on:
+  workflow_dispatch:
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    env:
+      APP_NAME: "文书生成系统"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pillow python-docx
+      - name: Prepare fonts
+        run: |
+          mkdir -p assets/fonts
+          curl -L -o assets/fonts/MaShanZheng-Regular.ttf https://github.com/google/fonts/raw/main/ofl/mashanzheng/MaShanZheng-Regular.ttf
+          curl -L -o assets/fonts/ZhiMangXing-Regular.ttf https://github.com/google/fonts/raw/main/ofl/zhimangxing/ZhiMangXing-Regular.ttf
+          curl -L -o assets/fonts/LongCang-Regular.ttf https://github.com/google/fonts/raw/main/ofl/longcang/LongCang-Regular.ttf
+      - name: Generate iconset from favicon.ico
+        run: |
+          python - << 'PY'
+          import os
+          from PIL import Image
+          src = 'favicon.ico'
+          if not os.path.exists(src):
+              raise SystemExit('favicon.ico not found')
+          os.makedirs('app.iconset', exist_ok=True)
+          sizes = [16, 32, 64, 128, 256, 512, 1024]
+          img = Image.open(src).convert('RGBA')
+          for s in sizes:
+              im = img.resize((s, s), Image.LANCZOS)
+              im.save(f'app.iconset/icon_{s}x{s}.png')
+              if s != 1024:
+                  im2 = img.resize((s*2, s*2), Image.LANCZOS)
+                  im2.save(f'app.iconset/icon_{s}x{s}@2x.png')
+          PY
+      - name: Build icns
+        run: |
+          iconutil -c icns app.iconset -o app.icns
+      - name: Build app
+        run: |
+          pyinstaller --noconfirm --windowed --onefile --name "$APP_NAME" --icon app.icns --add-data "assets/fonts:assets/fonts" app.py
+      - name: Generate sample image
+        run: |
+          python - << 'PY'
+          import os
+          import document_gen as dg
+          os.makedirs('dist', exist_ok=True)
+          out = os.path.join('dist', 'sample_handwrite.png')
+          style = {"font": os.path.join('assets','fonts','MaShanZheng-Regular.ttf'), "font_size": 40, "line_gap": 18}
+          print(dg.generate_handwriting_image('示例文本\n第二行', out, style))
+          PY
+      - name: Upload sample image
+        uses: actions/upload-artifact@v4
+        with:
+          name: sample_handwrite.png
+          path: dist/sample_handwrite.png
+      - name: Package DMG
+        run: |
+          hdiutil create -volname "$APP_NAME" -srcfolder "dist/$APP_NAME.app" -ov -format UDZO "$APP_NAME.dmg"
+      - name: Setup signing keychain
+        if: ${{ secrets.DEVELOPER_ID_P12 && secrets.DEVELOPER_ID_P12_PASSWORD && secrets.SIGNING_IDENTITY }}
+        run: |
+          KEYCHAIN=build-signing.keychain-db
+          security create-keychain -p "temp-pass" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "temp-pass" "$KEYCHAIN"
+          echo "$DEVELOPER_ID_P12" | base64 --decode > developer.p12
+          security import developer.p12 -k "$KEYCHAIN" -P "$DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/\"//g')
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+      - name: Codesign app
+        if: ${{ secrets.DEVELOPER_ID_P12 && secrets.DEVELOPER_ID_P12_PASSWORD && secrets.SIGNING_IDENTITY }}
+        run: |
+          codesign --force --deep --options runtime --sign "$SIGNING_IDENTITY" "dist/$APP_NAME.app"
+        env:
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+      - name: Notarize DMG
+        if: ${{ secrets.AC_API_KEY && secrets.AC_KEY_ID && secrets.AC_ISSUER_ID }}
+        run: |
+          echo "$AC_API_KEY" | base64 --decode > authkey.p8
+          xcrun notarytool submit "$APP_NAME.dmg" --key ./authkey.p8 --key-id "$AC_KEY_ID" --issuer "$AC_ISSUER_ID" --wait
+        env:
+          AC_API_KEY: ${{ secrets.AC_API_KEY }}
+          AC_KEY_ID: ${{ secrets.AC_KEY_ID }}
+          AC_ISSUER_ID: ${{ secrets.AC_ISSUER_ID }}
+      - name: Staple app and dmg
+        if: ${{ secrets.AC_API_KEY && secrets.AC_KEY_ID && secrets.AC_ISSUER_ID }}
+        run: |
+          xcrun stapler staple "dist/$APP_NAME.app" || true
+          xcrun stapler staple "$APP_NAME.dmg" || true
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 文书生成系统.app
+          path: dist/文书生成系统.app
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 文书生成系统.dmg
+          path: 文书生成系统.dmg
